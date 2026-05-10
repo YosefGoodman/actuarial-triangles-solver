@@ -1,0 +1,1790 @@
+"""
+Actuarial Triangle System - V4
+==============================
+- Matrix layout (origin x dev), one sheet per triangle
+- 8 methods stacked on each sheet
+- User-weighted blend, hard error if weights != 100
+- CL / BF / Cape Cod / Loss Ratio: pure Excel formulas
+- Mack (variance), GLM (Poisson reserving), Freq-Sev (proper), Bayesian (full): Python static
+  - Mack: ASTIN Bulletin 1993/1999 — sigma^2 estimation, MSE, std error of reserve
+  - GLM: over-dispersed Poisson with row/col multiplicative effects (Renshaw-Verrall)
+  - Freq-Sev: separate count + severity development with appropriate severity LDFs
+  - Bayesian: conjugate Gamma-Poisson posterior, credibility derived from priors
+- Dynamic triangle addition via add_triangle()
+- Ships with 4 linked sample triangles (paid/incurred/counts/premium)
+"""
+
+import os
+import math
+import statistics
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side, Protection
+from openpyxl.formatting.rule import CellIsRule, FormulaRule, Rule
+from openpyxl.styles.differential import DifferentialStyle
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.utils import get_column_letter
+
+OUTPUT_PATH = r"C:\Users\yosef\Downloads\build_v4.12\ActuarialTriangle_V4.xlsx"
+
+# ---------------------------------------------------------------------------
+# Style palette
+# ---------------------------------------------------------------------------
+C = {
+    "header_bg":   "1F3864",
+    "header_fg":   "FFFFFF",
+    "section_bg":  "D6E4F0",
+    "metadata_bg": "FFF2CC",
+    "matrix_bg":   "FFFACD",
+    "engine_bg":   "EAF4FB",
+    "diag_bg":     "F2F2F2",
+    "weight_bg":   "FCE4D6",
+    "output_bg":   "C6EFCE",
+    "warn_bg":     "FFE699",
+    "error_bg":    "FF7070",
+    "ok_bg":       "C6EFCE",
+    "py_bg":       "E2EFDA",
+    "border":      "8EAADB",
+}
+
+UNLOCKED = Protection(locked=False)
+LOCKED   = Protection(locked=True)
+
+def font(bold=False, color="000000", size=10, italic=False):
+    return Font(name="Calibri", bold=bold, italic=italic, color=color, size=size)
+
+def fill(hexc): return PatternFill("solid", fgColor=hexc)
+def border():
+    s = Side(style="thin", color=C["border"])
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def style_header(cell, text, bg=None, fg=None, size=10):
+    cell.value = text
+    cell.font = font(bold=True, color=fg or C["header_fg"], size=size)
+    cell.fill = fill(bg or C["header_bg"])
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = border()
+
+def style_label(cell, text, bg=None):
+    cell.value = text
+    cell.font = font(bold=True)
+    cell.fill = fill(bg) if bg else cell.fill
+    cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    cell.border = border()
+
+def style_input(cell, value=None, num_fmt=None, bg=None):
+    if value is not None:
+        cell.value = value
+    cell.fill = fill(bg or C["matrix_bg"])
+    cell.border = border()
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell.protection = UNLOCKED
+    if num_fmt:
+        cell.number_format = num_fmt
+
+def style_formula(cell, formula, num_fmt="0.000", bg=None):
+    cell.value = formula
+    cell.fill = fill(bg or C["engine_bg"])
+    cell.border = border()
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell.number_format = num_fmt
+    cell.protection = LOCKED
+
+def style_static(cell, value, num_fmt="0", bg=None):
+    cell.value = value
+    cell.fill = fill(bg or C["py_bg"])
+    cell.border = border()
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell.number_format = num_fmt
+    cell.protection = LOCKED
+
+# ---------------------------------------------------------------------------
+# Workbook setup
+# ---------------------------------------------------------------------------
+wb = openpyxl.Workbook()
+wb.calculation.calcMode = "auto"
+wb.calculation.fullCalcOnLoad = True
+wb.calculation.forceFullCalc = True
+default = wb.active
+wb.remove(default)
+
+# ---------------------------------------------------------------------------
+# _index sheet (registry)
+# ---------------------------------------------------------------------------
+def build_index_sheet():
+    ws = wb.create_sheet("_index")
+    ws.sheet_properties.tabColor = "1F3864"
+    headers = ["triangle_id", "sheet_name", "type", "cumulative",
+               "granularity", "origin_basis", "LOB", "currency", "links_to"]
+    for i, h in enumerate(headers, 1):
+        style_header(ws.cell(1, i), h)
+        ws.column_dimensions[get_column_letter(i)].width = 18
+    ws.freeze_panes = "A2"
+    return ws
+
+# ---------------------------------------------------------------------------
+# _control sheet (global settings)
+# ---------------------------------------------------------------------------
+def build_control_sheet():
+    ws = wb.create_sheet("_control")
+    ws.sheet_properties.tabColor = "C00000"
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 50
+
+    ws.merge_cells("A1:C1")
+    style_header(ws["A1"], "GLOBAL CONTROL PANEL", size=12)
+    ws.row_dimensions[1].height = 26
+
+    settings = [
+        ("Default Tail Factor",  1.000, "Applied to last LDF if no tail override on sheet"),
+        ("Risk Sensitivity",     "Medium", "Low | Medium | High"),
+        ("Maturity Threshold",   0.50, "Below this -> prefer BF over CL"),
+        ("CV Threshold (Low)",   0.20, "Below = stable triangle"),
+        ("CV Threshold (High)",  0.40, "Above = unstable, increase Bayesian/BF weight"),
+    ]
+    for i, (k, v, note) in enumerate(settings, start=3):
+        style_label(ws.cell(i, 1), k, bg=C["section_bg"])
+        style_input(ws.cell(i, 2), v)
+        ws.cell(i, 3).value = note
+        ws.cell(i, 3).font = font(italic=True, color="595959")
+        ws.cell(i, 3).border = border()
+    return ws
+
+# ---------------------------------------------------------------------------
+# Per-triangle sheet builder
+# ---------------------------------------------------------------------------
+METHODS = [
+    ("CL",    "Chain Ladder",       "Cumulative triangle",         "formula"),
+    ("Mack",  "Mack Model",         "Full triangle + variance",    "python"),
+    ("BF",    "Bornhuetter-Ferguson","ELR + triangle",             "formula"),
+    ("CC",    "Cape Cod",           "Premium + triangle",          "formula"),
+    ("LR",    "Loss Ratio",         "Premium + ELR (no triangle)", "formula"),
+    ("FS",    "Frequency-Severity", "Counts + paid linkage",       "python"),
+    ("GLM",   "GLM",                "Exposure + covariates",       "python"),
+    ("Bayes", "Bayesian",           "Prior + triangle",            "python"),
+]
+
+def add_triangle(triangle_id, sheet_name, type_, cumulative, granularity,
+                 origin_basis, lob, currency, origin_periods, dev_periods,
+                 data_matrix, links_to=None, elr=None, premium_link=None,
+                 prior_ultimate=None):
+    """
+    Create a self-contained triangle sheet.
+
+    data_matrix: list of lists, same shape as origin_periods x dev_periods,
+                 use None for missing cells.
+    """
+    if links_to is None: links_to = []
+    n_origin = len(origin_periods)
+    n_dev    = len(dev_periods)
+
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_properties.tabColor = "1F3864" if type_ == "paid_loss" else "70AD47"
+
+    # ----- column widths
+    ws.column_dimensions["A"].width = 16
+    for i in range(2, 2 + max(n_dev, 10) + 2):
+        ws.column_dimensions[get_column_letter(i)].width = 14
+
+    # =========================================================
+    # SECTION 1: METADATA (rows 1-8)
+    # =========================================================
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2 + n_dev)
+    style_header(ws.cell(1, 1), f"TRIANGLE: {triangle_id}  |  {type_.upper()}  |  {lob.upper()}", size=12)
+    ws.row_dimensions[1].height = 26
+
+    meta = [
+        ("triangle_id", triangle_id),
+        ("type", type_),
+        ("cumulative", "Y" if cumulative else "N"),
+        ("granularity", granularity),
+        ("origin_basis", origin_basis),
+        ("LOB / currency", f"{lob} / {currency}"),
+        ("links_to", ", ".join(links_to) if links_to else "—"),
+    ]
+    for i, (k, v) in enumerate(meta, start=2):
+        style_label(ws.cell(i, 1), k, bg=C["metadata_bg"])
+        ws.cell(i, 2).value = v
+        ws.cell(i, 2).fill = fill(C["metadata_bg"])
+        ws.cell(i, 2).border = border()
+        ws.cell(i, 2).alignment = Alignment(horizontal="left")
+        ws.merge_cells(start_row=i, start_column=2, end_row=i, end_column=2 + n_dev)
+
+    # =========================================================
+    # SECTION 2: DATA MATRIX
+    # =========================================================
+    DATA_HEADER_ROW = 10
+    DATA_FIRST_ROW  = 11
+    DATA_LAST_ROW   = DATA_FIRST_ROW + n_origin - 1
+
+    ws.merge_cells(start_row=9, start_column=1, end_row=9, end_column=2 + n_dev)
+    style_header(ws.cell(9, 1), "DATA MATRIX (origin × development)", bg=C["section_bg"], fg="1F3864")
+
+    style_header(ws.cell(DATA_HEADER_ROW, 1), "Origin \\ Dev", bg=C["section_bg"], fg="1F3864")
+    for j, dev in enumerate(dev_periods):
+        style_header(ws.cell(DATA_HEADER_ROW, 2 + j), str(dev), bg=C["section_bg"], fg="1F3864")
+
+    for i, origin in enumerate(origin_periods):
+        r = DATA_FIRST_ROW + i
+        style_label(ws.cell(r, 1), str(origin), bg=C["section_bg"])
+        for j, dev in enumerate(dev_periods):
+            cell = ws.cell(r, 2 + j)
+            val = data_matrix[i][j] if i < len(data_matrix) and j < len(data_matrix[i]) else None
+            style_input(cell, val, num_fmt="#,##0")
+
+    # =========================================================
+    # SECTION 3: ENGINE - LINK RATIOS (formula)
+    # =========================================================
+    ENG_LR_HEAD = DATA_LAST_ROW + 2
+    ws.merge_cells(start_row=ENG_LR_HEAD, start_column=1, end_row=ENG_LR_HEAD, end_column=2 + n_dev)
+    style_header(ws.cell(ENG_LR_HEAD, 1), "ENGINE — LINK RATIOS (per origin, dev→dev+1)",
+                 bg=C["section_bg"], fg="1F3864")
+
+    LR_HEAD_ROW = ENG_LR_HEAD + 1
+    LR_FIRST    = LR_HEAD_ROW + 1
+    LR_LAST     = LR_FIRST + n_origin - 1
+
+    style_header(ws.cell(LR_HEAD_ROW, 1), "Origin", bg=C["engine_bg"], fg="1F3864")
+    for j in range(n_dev - 1):
+        style_header(ws.cell(LR_HEAD_ROW, 2 + j),
+                     f"{dev_periods[j]}→{dev_periods[j+1]}",
+                     bg=C["engine_bg"], fg="1F3864")
+
+    for i in range(n_origin):
+        r_data = DATA_FIRST_ROW + i
+        r_lr   = LR_FIRST + i
+        style_label(ws.cell(r_lr, 1), str(origin_periods[i]), bg=C["engine_bg"])
+        for j in range(n_dev - 1):
+            cur  = ws.cell(r_data, 2 + j).coordinate
+            nxt  = ws.cell(r_data, 2 + j + 1).coordinate
+            f_   = f"=IF(AND(ISNUMBER({cur}),ISNUMBER({nxt}),{cur}>0),{nxt}/{cur},NA())"
+            style_formula(ws.cell(r_lr, 2 + j), f_, "0.0000")
+
+    # =========================================================
+    # SECTION 4: VOLUME-WEIGHTED LDFs / CDFs / TAIL
+    # =========================================================
+    LDF_ROW   = LR_LAST + 2
+    CDF_ROW   = LDF_ROW + 1
+    TAIL_ROW  = LDF_ROW + 2
+
+    style_label(ws.cell(LDF_ROW, 1), "LDF (volume-wtd)", bg=C["engine_bg"])
+    style_label(ws.cell(CDF_ROW, 1), "CDF to Ultimate", bg=C["engine_bg"])
+    style_label(ws.cell(TAIL_ROW, 1), "Tail Factor", bg=C["weight_bg"])
+
+    for j in range(n_dev - 1):
+        col_letter = get_column_letter(2 + j)
+        col_data   = get_column_letter(2 + j)
+        col_data2  = get_column_letter(2 + j + 1)
+        # volume-weighted LDF = sum of next col / sum of current col (paired)
+        sum_num = f"SUMPRODUCT(({col_data2}{DATA_FIRST_ROW}:{col_data2}{DATA_LAST_ROW})*ISNUMBER({col_data}{DATA_FIRST_ROW}:{col_data}{DATA_LAST_ROW}))"
+        sum_den = f"SUMPRODUCT(({col_data}{DATA_FIRST_ROW}:{col_data}{DATA_LAST_ROW})*ISNUMBER({col_data2}{DATA_FIRST_ROW}:{col_data2}{DATA_LAST_ROW}))"
+        f_ldf = f"=IFERROR({sum_num}/{sum_den},NA())"
+        style_formula(ws.cell(LDF_ROW, 2 + j), f_ldf, "0.0000")
+
+    # tail factor input cell at last dev column
+    tail_col = 2 + n_dev - 1
+    style_input(ws.cell(TAIL_ROW, tail_col), 1.000, num_fmt="0.0000", bg=C["weight_bg"])
+
+    # CDFs: cumulative product from each dev period out to ultimate (incl. tail)
+    for j in range(n_dev):
+        if j == n_dev - 1:
+            # only tail
+            f_cdf = f"={ws.cell(TAIL_ROW, tail_col).coordinate}"
+        else:
+            ldf_range_start = ws.cell(LDF_ROW, 2 + j).coordinate
+            ldf_range_end   = ws.cell(LDF_ROW, 2 + n_dev - 2).coordinate
+            f_cdf = f"=PRODUCT({ldf_range_start}:{ldf_range_end})*{ws.cell(TAIL_ROW, tail_col).coordinate}"
+        style_formula(ws.cell(CDF_ROW, 2 + j), f_cdf, "0.0000")
+
+    # =========================================================
+    # SECTION 5: METHOD ULTIMATES (8 stacked, one row per origin)
+    # =========================================================
+    METH_HEAD = TAIL_ROW + 2
+    ws.merge_cells(start_row=METH_HEAD, start_column=1, end_row=METH_HEAD, end_column=2 + len(METHODS))
+    style_header(ws.cell(METH_HEAD, 1),
+                 "ENGINE — METHOD ULTIMATES (per origin)",
+                 bg=C["section_bg"], fg="1F3864")
+
+    METH_COL_HEAD = METH_HEAD + 1
+    METH_FIRST    = METH_COL_HEAD + 1
+    METH_LAST     = METH_FIRST + n_origin - 1
+
+    style_header(ws.cell(METH_COL_HEAD, 1), "Origin", bg=C["engine_bg"], fg="1F3864")
+    for k, (code, name, _, kind) in enumerate(METHODS):
+        bg = C["py_bg"] if kind == "python" else C["engine_bg"]
+        style_header(ws.cell(METH_COL_HEAD, 2 + k), code, bg=bg, fg="1F3864")
+
+    # Helper: latest known cumulative on diagonal for each origin
+    def latest_cum_cell(i):
+        # walk dev cells right-to-left, return formula picking last numeric
+        # We use INDEX(MATCH) with ISNUMBER reverse via LOOKUP trick:
+        # =LOOKUP(2,1/ISNUMBER(range),range) returns last numeric
+        r = DATA_FIRST_ROW + i
+        rng = f"{get_column_letter(2)}{r}:{get_column_letter(2 + n_dev - 1)}{r}"
+        return f"LOOKUP(2,1/ISNUMBER({rng}),{rng})"
+
+    def dev_index_cell(i):
+        # Column position of latest numeric cell (1..n_dev), used to fetch CDF.
+        # LOOKUP(2, 1/ISNUMBER(range), {1,2,...,n_dev}) returns the POSITION of
+        # the last numeric cell. Robust to repeated cumulative values (unlike
+        # MATCH(LOOKUP(...), range, 0) which returns the FIRST match).
+        # Note: array constant must be horizontal ({1,2,3}) since 1/ISNUMBER(row_range)
+        # is horizontal; vertical {1;2;3} would not align in Excel/LibreOffice.
+        r = DATA_FIRST_ROW + i
+        rng = f"{get_column_letter(2)}{r}:{get_column_letter(2 + n_dev - 1)}{r}"
+        positions = "{" + ",".join(str(k+1) for k in range(n_dev)) + "}"
+        return f"LOOKUP(2,1/ISNUMBER({rng}),{positions})"
+
+    elr_cell_addr = None  # filled if BF/LR/CC need ELR input
+
+    for i in range(n_origin):
+        r = METH_FIRST + i
+        style_label(ws.cell(r, 1), str(origin_periods[i]), bg=C["engine_bg"])
+        latest = latest_cum_cell(i)
+        devidx = dev_index_cell(i)
+        cdf_range = f"{get_column_letter(2)}{CDF_ROW}:{get_column_letter(2 + n_dev - 1)}{CDF_ROW}"
+        # Use OFFSET from the first CDF cell instead of INDEX to avoid Excel's
+        # implicit-intersection operator (@) being auto-inserted when the file
+        # is re-opened in Excel 365/2021+. INDEX(range, 1, scalar) on a 1-row
+        # range looks ambiguous to Excel's parser; OFFSET(anchor, 0, n) is
+        # unambiguous and renders cleanly in both Excel and LibreOffice.
+        cdf_anchor = f"{get_column_letter(2)}{CDF_ROW}"
+        cdf_at_dev = f"OFFSET({cdf_anchor},0,{devidx}-1)"
+
+        for k, (code, name, _, kind) in enumerate(METHODS):
+            col = 2 + k
+            cell = ws.cell(r, col)
+
+            if kind == "python":
+                # placeholder; populated by run_python_methods later
+                style_static(cell, "PENDING", num_fmt="#,##0", bg=C["py_bg"])
+                continue
+
+            if code == "CL":
+                f_ = f"=IFERROR({latest}*{cdf_at_dev},NA())"
+                style_formula(cell, f_, "#,##0")
+
+            elif code == "Mack":
+                # Mack point estimate handled by Python (with variance)
+                style_static(cell, "PENDING", num_fmt="#,##0", bg=C["py_bg"])
+                continue
+
+            elif code == "BF":
+                # Expected unreported = Premium * ELR * (1 - 1/CDF)
+                # Ultimate = Latest + Expected unreported.
+                # If premium cell is blank/zero, BF is not applicable -> NA.
+                prem_ref = f"PREM_{triangle_id}_{origin_periods[i]}"
+                f_ = (f"=IF(OR(NOT(ISNUMBER({prem_ref})),{prem_ref}=0),NA(),"
+                      f"IFERROR({latest}+ELR_{triangle_id}*{prem_ref}*(1-1/{cdf_at_dev}),NA()))")
+                style_formula(cell, f_, "#,##0")
+
+            elif code == "CC":
+                # Cape Cod: ELR_CC derived from data, then BF formula.
+                # ELR_CC = SUM(Latest_i) / SUM(Premium_i * 1/CDF_i)   (used-up premium basis)
+                prem_ref = f"PREM_{triangle_id}_{origin_periods[i]}"
+                f_ = (f"=IF(OR(NOT(ISNUMBER({prem_ref})),{prem_ref}=0),NA(),"
+                      f"IFERROR({latest}+ELR_CC_{triangle_id}*{prem_ref}*(1-1/{cdf_at_dev}),NA()))")
+                style_formula(cell, f_, "#,##0")
+
+            elif code == "LR":
+                # Pure loss ratio: Ultimate = Premium * ELR.
+                # If premium cell is blank/zero, LR is not applicable -> NA.
+                prem_ref = f"PREM_{triangle_id}_{origin_periods[i]}"
+                f_ = (f"=IF(OR(NOT(ISNUMBER({prem_ref})),{prem_ref}=0),NA(),"
+                      f"IFERROR({prem_ref}*ELR_{triangle_id},NA()))")
+                style_formula(cell, f_, "#,##0")
+
+    # =========================================================
+    # SECTION 6: METHOD INPUTS (ELR, Premium, Prior)
+    # =========================================================
+    INP_HEAD = METH_LAST + 2
+    ws.merge_cells(start_row=INP_HEAD, start_column=1, end_row=INP_HEAD, end_column=2 + n_origin)
+    style_header(ws.cell(INP_HEAD, 1), "METHOD INPUTS (ELR / Premium / Prior)",
+                 bg=C["section_bg"], fg="1F3864")
+
+    # ----- LAYOUT (row order):
+    #   ELR_ROW         — ELR cell (auto-prefilled to ELR_CC, user can overwrite)
+    #   ELR_SUGG_ROW    — read-only label "Suggested ELR (Cape Cod): xx.x%"
+    #   PREM_ROW        — premium per origin
+    #   ELR_CC_ROW      — Cape Cod derived ELR (formula)
+    #   PRIOR_ROW       — Bayesian prior
+    #
+    # The ELR cell references ELR_CC by its named range, which is defined when
+    # ELR_CC_ROW is built below — Excel resolves named ranges at recalc time
+    # (not parse time), so forward references inside formulas are fine.
+    ELR_ROW       = INP_HEAD + 1
+    ELR_SUGG_ROW  = ELR_ROW + 1
+    PREM_ROW      = ELR_SUGG_ROW + 1
+    ELR_CC_ROW    = PREM_ROW + 1
+    PRIOR_ROW     = ELR_CC_ROW + 1
+
+    # ----- ELR cell (user-editable, defaults to ELR_CC via formula)
+    style_label(ws.cell(ELR_ROW, 1), "ELR (for BF / LR)", bg=C["weight_bg"])
+    elr_cell = ws.cell(ELR_ROW, 2)
+    if elr is not None:
+        # explicit override from build script
+        style_input(elr_cell, elr, num_fmt="0.0%", bg=C["weight_bg"])
+    else:
+        # auto-default: pull from ELR_CC; user can overwrite
+        elr_cell.value = f"=IFERROR(ELR_CC_{triangle_id},0.65)"
+        elr_cell.fill = fill(C["weight_bg"])
+        elr_cell.border = border()
+        elr_cell.alignment = Alignment(horizontal="center")
+        elr_cell.number_format = "0.0%"
+        elr_cell.protection = UNLOCKED   # still user-editable
+    wb.defined_names[f"ELR_{triangle_id}"] = DefinedName(
+        f"ELR_{triangle_id}", attr_text=f"'{sheet_name}'!${elr_cell.column_letter}${elr_cell.row}")
+
+    # ----- Suggested ELR (read-only display: shows ELR_CC for reference)
+    style_label(ws.cell(ELR_SUGG_ROW, 1),
+                "Suggested ELR (Cape Cod, data-driven)", bg=C["diag_bg"])
+    sugg_cell = ws.cell(ELR_SUGG_ROW, 2)
+    sugg_cell.value = f"=IFERROR(ELR_CC_{triangle_id},NA())"
+    sugg_cell.fill = fill(C["diag_bg"])
+    sugg_cell.border = border()
+    sugg_cell.alignment = Alignment(horizontal="center")
+    sugg_cell.number_format = "0.0%"
+    sugg_cell.protection = LOCKED
+    sugg_cell.font = font(italic=True, color="666666", size=9)
+
+    # ----- Premium per origin row
+    style_label(ws.cell(PREM_ROW, 1), "Premium per origin", bg=C["weight_bg"])
+    for i, origin in enumerate(origin_periods):
+        c = ws.cell(PREM_ROW, 2 + i)
+        if premium_link:
+            prem_sheet = premium_link
+            prem_origin_row = DATA_FIRST_ROW + i
+            prem_rng = f"'{prem_sheet}'!{get_column_letter(2)}{prem_origin_row}:{get_column_letter(2 + n_dev - 1)}{prem_origin_row}"
+            c.value = f"=SUM({prem_rng})"
+            c.fill = fill(C["engine_bg"])
+            c.protection = LOCKED
+        else:
+            c.value = None
+        c.border = border()
+        c.alignment = Alignment(horizontal="center")
+        c.number_format = "#,##0"
+        if not premium_link:
+            c.fill = fill(C["weight_bg"])
+            c.protection = UNLOCKED
+        wb.defined_names[f"PREM_{triangle_id}_{origin}"] = DefinedName(
+            f"PREM_{triangle_id}_{origin}",
+            attr_text=f"'{sheet_name}'!${c.column_letter}${c.row}")
+
+    # ----- ELR_CC (Cape Cod derived ELR) — formula
+    style_label(ws.cell(ELR_CC_ROW, 1), "ELR_CC (Cape Cod derived)", bg=C["engine_bg"])
+    num_terms = []
+    den_terms = []
+    positions_array = "{" + ",".join(str(k+1) for k in range(n_dev)) + "}"
+    for i, origin in enumerate(origin_periods):
+        rng = f"{get_column_letter(2)}{DATA_FIRST_ROW + i}:{get_column_letter(2 + n_dev - 1)}{DATA_FIRST_ROW + i}"
+        latest = f"LOOKUP(2,1/ISNUMBER({rng}),{rng})"
+        devidx = f"LOOKUP(2,1/ISNUMBER({rng}),{positions_array})"
+        cdf_anchor = f"{get_column_letter(2)}{CDF_ROW}"
+        cdf_at = f"OFFSET({cdf_anchor},0,{devidx}-1)"
+        prem_ref = f"PREM_{triangle_id}_{origin}"
+        num_terms.append(f"IFERROR({latest},0)")
+        den_terms.append(f"IFERROR({prem_ref}*(1/{cdf_at}),0)")
+    num = "+".join(num_terms)
+    den = "+".join(den_terms)
+    f_cc = f"=IFERROR(({num})/({den}),NA())"
+    style_formula(ws.cell(ELR_CC_ROW, 2), f_cc, "0.0%")
+    cc_cell = ws.cell(ELR_CC_ROW, 2)
+    wb.defined_names[f"ELR_CC_{triangle_id}"] = DefinedName(
+        f"ELR_CC_{triangle_id}", attr_text=f"'{sheet_name}'!${cc_cell.column_letter}${cc_cell.row}")
+
+    # ----- Bayesian prior (single cell, optional)
+    style_label(ws.cell(PRIOR_ROW, 1), "Bayesian prior ultimate (total)", bg=C["weight_bg"])
+    style_input(ws.cell(PRIOR_ROW, 2),
+                prior_ultimate if prior_ultimate is not None else "",
+                num_fmt="#,##0", bg=C["weight_bg"])
+
+    # =========================================================
+    # SECTION 7: METHOD WEIGHTS  (per-AY, with uniform toggle)
+    # Friedland Ch. 15: "weights may be consistent for all years or may vary
+    # by accident year". The uniform row is the simple case; per-AY rows give
+    # full flexibility. A toggle picks which set the blend uses.
+    # =========================================================
+    WT_HEAD = PRIOR_ROW + 2
+    ws.merge_cells(start_row=WT_HEAD, start_column=1, end_row=WT_HEAD, end_column=2 + len(METHODS))
+    style_header(ws.cell(WT_HEAD, 1), "METHOD WEIGHTS (must total 100%)",
+                 bg=C["section_bg"], fg="1F3864")
+
+    # Toggle: "Uniform" (single row applies to all AYs) or "Per-AY" (per-row weights)
+    WT_MODE_ROW = WT_HEAD + 1
+    style_label(ws.cell(WT_MODE_ROW, 1), "Mode (Uniform / Per-AY)", bg=C["weight_bg"])
+    mode_cell = ws.cell(WT_MODE_ROW, 2)
+    mode_cell.value = "Uniform"
+    mode_cell.fill = fill(C["weight_bg"])
+    mode_cell.border = border()
+    mode_cell.alignment = Alignment(horizontal="center")
+    mode_cell.protection = UNLOCKED
+    # data validation list (Uniform / Per-AY)
+    from openpyxl.worksheet.datavalidation import DataValidation
+    dv = DataValidation(type="list", formula1='"Uniform,Per-AY"', allow_blank=False)
+    ws.add_data_validation(dv)
+    dv.add(mode_cell)
+    wb.defined_names[f"WT_MODE_{triangle_id}"] = DefinedName(
+        f"WT_MODE_{triangle_id}", attr_text=f"'{sheet_name}'!${mode_cell.column_letter}${mode_cell.row}")
+
+    # Uniform weight row (single row applied to all AYs when mode = "Uniform")
+    WT_LABEL_ROW = WT_MODE_ROW + 1
+    WT_VAL_ROW   = WT_MODE_ROW + 2
+    style_label(ws.cell(WT_LABEL_ROW, 1), "Method", bg=C["weight_bg"])
+    style_label(ws.cell(WT_VAL_ROW, 1), "Uniform weight %", bg=C["weight_bg"])
+    for k, (code, _, _, _) in enumerate(METHODS):
+        style_header(ws.cell(WT_LABEL_ROW, 2 + k), code, bg=C["weight_bg"], fg="000000")
+        style_input(ws.cell(WT_VAL_ROW, 2 + k), 0, num_fmt="0.0%", bg=C["weight_bg"])
+
+    is_blendable = type_ in ("paid_loss", "incurred_loss", "reported_counts",
+                             "closed_counts", "claim_counts")
+
+    # If the matrix has no observations at all, no method can blend. Force all
+    # weights to 0 (the weight check will pass because nothing is assigned, and
+    # the user can fill in data + weights themselves later).
+    matrix_is_empty = all(
+        all(v is None for v in row) for row in data_matrix
+    ) if data_matrix else True
+
+    # ----- Auto-detect default weights based on data signals + method availability.
+    # Decision rules (sourced from Friedland Ch. 7-10, 15):
+    #   - CL credibility ≈ 1/CDF (Brosius). Mature → CL; immature → BF/CC.
+    #   - BF/CC require premium (CC derives ELR from data, so prefer CC unless
+    #     data is "thin or volatile" — Friedland Ch. 10 says CC "is not necessarily
+    #     as appropriate as BF if the data is extremely thin or volatile").
+    #   - LR alone ignores actuals. Friedland Ch. 8 explicitly warns that LR can
+    #     produce negative IBNR — use only as a small stabilizer, never a primary.
+    #   - GLM (ODP) point estimates equal CL (Renshaw-Verrall). Adding GLM weight
+    #     when CL already has weight just duplicates information.
+    #   - Mack has the same point estimate as CL but adds variance info — give it
+    #     a meaningful weight so the ensemble reflects parameter uncertainty.
+    #
+    # Data signals computed from the matrix:
+    has_premium = (premium_link is not None)
+
+    if type_ in ("paid_loss", "incurred_loss"):
+        # 1. Average maturity (% reported across origins) using the same
+        #    volume-weighted CL we'll show in the workbook.
+        try:
+            ldfs_now  = volume_weighted_ldfs(data_matrix, n_dev)
+            cdfs_now  = cdfs_from_ldfs(ldfs_now, n_dev, tail=1.0)
+            pcts = []
+            for i in range(n_origin):
+                latest_j = max(j for j in range(n_dev) if data_matrix[i][j] is not None)
+                if cdfs_now[latest_j] > 0:
+                    pcts.append(1.0 / cdfs_now[latest_j])
+            avg_maturity = sum(pcts) / len(pcts) if pcts else 0.5
+        except Exception:
+            avg_maturity = 0.5  # safe fallback
+
+        # 2. LDF stability: CV of LDFs across dev periods (high = volatile triangle).
+        try:
+            valid_ldfs = [x for x in ldfs_now if x is not None and x > 0]
+            if len(valid_ldfs) >= 2:
+                mu = sum(valid_ldfs) / len(valid_ldfs)
+                var = sum((x-mu)**2 for x in valid_ldfs) / (len(valid_ldfs)-1)
+                ldf_cv = (var ** 0.5) / mu if mu > 0 else 0.0
+            else:
+                ldf_cv = 0.0
+        except Exception:
+            ldf_cv = 0.0
+
+        # 3. Downward development flag (any LDF < 1 → Friedland warns BF is
+        #    theoretically problematic with CDF<1; downweight BF when present).
+        has_downward = any((x is not None and x < 1.0) for x in ldfs_now) if ldfs_now else False
+
+        # ----- Pick weights from these signals
+        # Start with CL credibility = avg_maturity (Brosius), bounded [0.30, 0.80].
+        cl_z = max(0.30, min(0.80, avg_maturity))
+
+        # If no premium, all weight goes to data-driven (CL + Mack). GLM excluded
+        # because GLM ult ≡ CL ult (Renshaw-Verrall) — adding it is redundant.
+        if not has_premium:
+            defaults = [round(cl_z, 2),               # CL
+                        round(1.0 - cl_z, 2),         # Mack
+                        0.0, 0.0, 0.0,                # BF, CC, LR (no premium)
+                        0.0, 0.0, 0.0]                # FS, GLM, Bayes
+        else:
+            # With premium: split the (1 - cl_z) "expected-claims" weight between
+            # BF and CC, biased by data quality:
+            #   - Stable triangle (low LDF CV) → favor CC (Friedland: "more responsive")
+            #   - Volatile / thin → favor BF (Friedland: BF more robust to volatility)
+            ec_weight = 1.0 - cl_z          # weight going to expected-claims family
+            mack_share = 0.20               # always reserve some for parameter risk
+            ec_weight = max(0.0, ec_weight - mack_share * 0.5)
+            cl_w = cl_z - mack_share * 0.5
+
+            if ldf_cv > 0.30 or n_origin <= 4:
+                # Volatile or thin → favor BF (judgmental ELR, Friedland Ch. 9)
+                bf_w, cc_w = ec_weight * 0.65, ec_weight * 0.35
+            else:
+                # Stable + enough data → favor CC (data-derived ELR, Friedland Ch. 10)
+                bf_w, cc_w = ec_weight * 0.30, ec_weight * 0.70
+
+            # If downward development is present, shift BF→CL (Friedland Ch. 9 fn 41
+            # / "BF method and CDFs less than 1.00" note).
+            if has_downward:
+                cl_w  += bf_w * 0.5
+                bf_w  *= 0.5
+
+            # LR: only a small stabilizer, and only when triangle is reasonably
+            # mature so LR=Premium*ELR doesn't drag the blend down on mature years.
+            lr_w = 0.05 if avg_maturity > 0.70 else 0.0
+            # Renormalize: pull the lr_w from the largest of (cl_w, bf_w, cc_w)
+            if lr_w > 0:
+                biggest = max(cl_w, bf_w, cc_w)
+                if biggest == cl_w:   cl_w -= lr_w
+                elif biggest == bf_w: bf_w -= lr_w
+                else:                 cc_w -= lr_w
+
+            # Build vector & round to 2dp; correct any rounding drift onto CL
+            raw = [cl_w, mack_share, bf_w, cc_w, lr_w, 0.0, 0.0, 0.0]
+            defaults = [round(x, 2) for x in raw]
+            drift = round(1.0 - sum(defaults), 2)
+            defaults[0] = round(defaults[0] + drift, 2)
+
+    elif type_ in ("reported_counts", "closed_counts", "claim_counts"):
+        # Counts: no premium concept → BF/CC/LR not applicable.
+        # GLM ≡ CL on counts too (same multiplicative model). Use CL + Mack only.
+        defaults = [0.60, 0.40, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
+    else:
+        # Premium / exposure: not blendable
+        defaults = [0.00] * len(METHODS)
+
+    # Override to all zeros if the matrix has no data — nothing to blend.
+    if matrix_is_empty:
+        defaults = [0.00] * len(METHODS)
+
+    for k, v in enumerate(defaults):
+        ws.cell(WT_VAL_ROW, 2 + k).value = v
+
+    # Uniform total + per-row total checks
+    TOTAL_COL = 2 + len(METHODS)
+    style_label(ws.cell(WT_LABEL_ROW, TOTAL_COL + 1), "TOTAL", bg=C["weight_bg"])
+    uni_start = ws.cell(WT_VAL_ROW, 2).coordinate
+    uni_end   = ws.cell(WT_VAL_ROW, 2 + len(METHODS) - 1).coordinate
+    style_formula(ws.cell(WT_VAL_ROW, TOTAL_COL + 1),
+                  f"=SUM({uni_start}:{uni_end})", "0.0%",
+                  bg=C["weight_bg"])
+
+    # Per-AY weight grid: one row per origin, defaulting to a copy of the uniform row.
+    # Cells stay user-editable; the blend formula picks per-AY only when mode = "Per-AY".
+    PERAY_FIRST = WT_VAL_ROW + 1
+    PERAY_LAST  = PERAY_FIRST + n_origin - 1
+    style_label(ws.cell(PERAY_FIRST - 0, 1), f"Per-AY: {origin_periods[0]}", bg=C["weight_bg"])
+    for i, origin in enumerate(origin_periods):
+        r = PERAY_FIRST + i
+        if i > 0:
+            style_label(ws.cell(r, 1), f"Per-AY: {origin}", bg=C["weight_bg"])
+        for k in range(len(METHODS)):
+            cell = ws.cell(r, 2 + k)
+            # default = same as uniform row
+            cell.value = f"={ws.cell(WT_VAL_ROW, 2 + k).coordinate}"
+            cell.fill = fill(C["weight_bg"])
+            cell.border = border()
+            cell.alignment = Alignment(horizontal="center")
+            cell.number_format = "0.0%"
+            cell.protection = UNLOCKED
+        # per-row total
+        rs = ws.cell(r, 2).coordinate
+        re = ws.cell(r, 2 + len(METHODS) - 1).coordinate
+        style_formula(ws.cell(r, TOTAL_COL + 1), f"=SUM({rs}:{re})",
+                      "0.0%", bg=C["weight_bg"])
+
+    # Validation cell — checks BOTH modes
+    VAL_ROW = PERAY_LAST + 1
+    style_label(ws.cell(VAL_ROW, 1), "Weight check", bg=C["weight_bg"])
+    uni_total = ws.cell(WT_VAL_ROW, TOTAL_COL + 1).coordinate
+
+    if is_blendable:
+        # Per-row totals for per-AY rows, checking each = 100%
+        peray_totals = [ws.cell(PERAY_FIRST + i, TOTAL_COL + 1).coordinate
+                        for i in range(n_origin)]
+        # "MAX(ABS(total - 1))" across all per-AY rows; >tol means at least one is off
+        peray_max_dev = (
+            "MAX(" + ",".join(f"ABS({t}-1)" for t in peray_totals) + ")"
+        )
+
+        # N/A method check: if a method column is N/A (text/error) for some origin,
+        # but that origin's effective weight (depending on mode) is > 0, that's an error.
+        #
+        # Excel-strict note: we cannot use IF(condition, range_a, range_b) because
+        # Excel's strict validator rejects IF returning a range (LibreOffice allows
+        # it; Excel does not — workbook gets "repaired" and the formula stripped).
+        # Instead we use the algebraic identity:
+        #   effective_weight = (mode="Uniform")*uni_row + (mode="Per-AY")*peray_row
+        # which produces the same range, but with arithmetic combinators that are
+        # always valid in array context.
+        # N/A method check: per origin, per method, check if a non-numeric ult
+        # has a non-zero weight assigned. Expanded cell-by-cell to avoid any
+        # range-arithmetic patterns that Excel might wrap with @ on open.
+        na_terms = []
+        for ii in range(n_origin):
+            r_meth = METH_FIRST + ii
+            for k in range(len(METHODS)):
+                m_cell = ws.cell(r_meth, 2 + k).coordinate
+                uw_cell = ws.cell(WT_VAL_ROW, 2 + k).coordinate
+                pw_cell = ws.cell(PERAY_FIRST + ii, 2 + k).coordinate
+                eff_w = (f'(({mode_cell.coordinate}="Uniform")*{uw_cell}'
+                         f'+({mode_cell.coordinate}="Per-AY")*{pw_cell})')
+                # contributes 1 if (weight>0) AND (cell is not a number)
+                na_terms.append(f"(({eff_w}>0)*NOT(ISNUMBER({m_cell})))")
+        all_na_sum = "+".join(na_terms)
+
+    if is_blendable and matrix_is_empty:
+        # No data → blend is undefined. Show clear message instead of the
+        # misleading "weights must sum to 100%" error from an all-zero row.
+        ws.cell(VAL_ROW, 2).value = "NEEDS DATA (matrix is empty)"
+        ws.cell(VAL_ROW, 2).fill = fill(C["diag_bg"])
+        ws.cell(VAL_ROW, 2).border = border()
+        ws.cell(VAL_ROW, 2).alignment = Alignment(horizontal="center")
+    elif is_blendable:
+        # Combined validation:
+        #   Hard ERROR: weights don't sum to 100% (Uniform or Per-AY)
+        #   Soft INFO:  weight assigned to a method that returned N/A
+        #               (blended formula treats it as 0 contribution, so
+        #                this is informational, not blocking)
+        formula = (
+            f'=IF({mode_cell.coordinate}="Uniform",'
+            f'  IF(ROUND({uni_total},6)<>1,"ERROR: uniform weights must sum to 100%",'
+            f'    IF(({all_na_sum})>0,"INFO: weight on N/A method (treated as 0)","OK")),'
+            f'  IF({peray_max_dev}>0.000001,"ERROR: every per-AY row must sum to 100%",'
+            f'    IF(({all_na_sum})>0,"INFO: weight on N/A method (treated as 0)","OK")))'
+        )
+        style_formula(ws.cell(VAL_ROW, 2), formula, "@", bg=C["weight_bg"])
+    else:
+        ws.cell(VAL_ROW, 2).value = "N/A (premium triangle)"
+        ws.cell(VAL_ROW, 2).fill = fill(C["diag_bg"])
+        ws.cell(VAL_ROW, 2).border = border()
+        ws.cell(VAL_ROW, 2).alignment = Alignment(horizontal="center")
+    # conditional formatting on validation cell.
+    # IMPORTANT: "contains text" must use a FormulaRule (or a containsText-typed Rule),
+    # NOT CellIsRule(operator="containsText"). The combination type=cellIs +
+    # operator=containsText is invalid OOXML — Excel strips the rule AND the
+    # formula on the same cell during file repair.
+    val_addr = ws.cell(VAL_ROW, 2).coordinate
+    ws.conditional_formatting.add(val_addr,
+        CellIsRule(operator="equal", formula=['"OK"'], fill=fill(C["ok_bg"])))
+    ws.conditional_formatting.add(val_addr,
+        FormulaRule(formula=[f'ISNUMBER(SEARCH("ERROR",{val_addr}))'], fill=fill(C["error_bg"])))
+    ws.conditional_formatting.add(val_addr,
+        FormulaRule(formula=[f'ISNUMBER(SEARCH("INFO",{val_addr}))'], fill=fill(C["warn_bg"])))
+
+    # =========================================================
+    # SECTION 8: BLENDED ULTIMATE & IBNR
+    # =========================================================
+    OUT_HEAD = VAL_ROW + 2
+    ws.merge_cells(start_row=OUT_HEAD, start_column=1, end_row=OUT_HEAD, end_column=5)
+    style_header(ws.cell(OUT_HEAD, 1), "OUTPUT — BLENDED ULTIMATE & IBNR",
+                 bg=C["section_bg"], fg="1F3864")
+
+    OUT_COL_HEAD = OUT_HEAD + 1
+    OUT_FIRST    = OUT_COL_HEAD + 1
+    headers_out = ["Origin", "Latest Cum", "Blended Ultimate", "IBNR", "% Reported"]
+    for j, h in enumerate(headers_out):
+        style_header(ws.cell(OUT_COL_HEAD, 1 + j), h, bg=C["output_bg"], fg="1F3864")
+
+    for i, origin in enumerate(origin_periods):
+        r = OUT_FIRST + i
+        meth_row = METH_FIRST + i
+        style_label(ws.cell(r, 1), str(origin), bg=C["output_bg"])
+
+        # Latest
+        rng = f"{get_column_letter(2)}{DATA_FIRST_ROW + i}:{get_column_letter(2 + n_dev - 1)}{DATA_FIRST_ROW + i}"
+        style_formula(ws.cell(r, 2),
+                      f"=LOOKUP(2,1/ISNUMBER({rng}),{rng})",
+                      "#,##0", bg=C["output_bg"])
+
+        if not is_blendable:
+            # Premium / exposure: no blended ultimate, no IBNR concept.
+            for c in [3, 4, 5]:
+                cell = ws.cell(r, c)
+                cell.value = "N/A"
+                cell.fill = fill(C["diag_bg"])
+                cell.border = border()
+                cell.alignment = Alignment(horizontal="center")
+            continue
+
+        # Blended ultimate: pick weights per mode using algebraic combination
+        # (NOT IF returning a range — Excel's strict validator rejects that).
+        #
+        # KEY GOTCHA: Excel 365 inserts @ (implicit intersection) into:
+        #   - IFERROR(range, ...)
+        #   - IF(condition, range, scalar)
+        #   - any function whose first arg is a range and is "scalar by default"
+        # When that @ is inserted inside SUMPRODUCT, the range collapses to one
+        # cell and the formula breaks → Excel "repairs" the file by stripping it.
+        #
+        # SOLUTION: pure multiplication on ranges. ISNUMBER(range) returns an
+        # array of TRUE/FALSE, multiplying by it masks non-numeric to 0.
+        # We replace the #N/A cells with 0 BEFORE multiplying, using N(range):
+        #   N(numeric) = numeric, N(#N/A) = #N/A  ← still propagates
+        # So we use ISNUMBER as a guard:
+        #   SUMPRODUCT(ISNUMBER(range)*range, weights)
+        # But TRUE * #N/A = #N/A in Excel, so we need another trick — wrap with
+        # SUMPRODUCT's natural error handling: it skips text/non-numeric when
+        # multiplied by a 0/1 mask via the +0 idiom: (mask)*(range+0) where the
+        # mask zeros the bad cells. Or better: use the ROW/INDEX expansion.
+        #
+        # Cleanest pattern that survives Excel parser: build the SUMPRODUCT as
+        # the SUM of individual cell products. Verbose but bulletproof.
+        m_cells = [ws.cell(meth_row, 2 + k).coordinate for k in range(len(METHODS))]
+        uw_cells = [ws.cell(WT_VAL_ROW, 2 + k).coordinate for k in range(len(METHODS))]
+        pw_cells = [ws.cell(PERAY_FIRST + i, 2 + k).coordinate for k in range(len(METHODS))]
+
+        # For each method k: contribution = (mode_uni * uw_k + mode_per * pw_k) * IFERROR(m_k, 0)
+        terms = []
+        for k in range(len(METHODS)):
+            w_k = (f'(({mode_cell.coordinate}="Uniform")*{uw_cells[k]}'
+                   f'+({mode_cell.coordinate}="Per-AY")*{pw_cells[k]})')
+            terms.append(f"IFERROR({m_cells[k]},0)*{w_k}")
+        # NOTE: no IF(val="OK",...,NA()) wrapper. IFERROR(method,0) on each
+        # term already zeros out failed methods, so a single broken method
+        # (e.g. FS without counts) silently gets 0 weight contribution
+        # instead of NA-ing the entire blended row. The weight-sum
+        # validation in B{VAL_ROW} still fires independently.
+        blended = ("=" + "+".join(terms))
+        style_formula(ws.cell(r, 3), blended, "#,##0", bg=C["output_bg"])
+
+        # IBNR = ultimate - latest
+        style_formula(ws.cell(r, 4),
+                      f"=IFERROR({ws.cell(r,3).coordinate}-{ws.cell(r,2).coordinate},NA())",
+                      "#,##0", bg=C["output_bg"])
+        # % reported
+        style_formula(ws.cell(r, 5),
+                      f"=IFERROR({ws.cell(r,2).coordinate}/{ws.cell(r,3).coordinate},NA())",
+                      "0.0%", bg=C["output_bg"])
+
+    # Totals row
+    TOT_ROW = OUT_FIRST + n_origin
+    style_label(ws.cell(TOT_ROW, 1), "TOTAL", bg=C["output_bg"])
+    if is_blendable:
+        for col in [2, 3, 4]:
+            rng = f"{get_column_letter(col)}{OUT_FIRST}:{get_column_letter(col)}{OUT_FIRST + n_origin - 1}"
+            style_formula(ws.cell(TOT_ROW, col), f"=SUM({rng})", "#,##0", bg=C["output_bg"])
+    else:
+        # Premium: only sum "Latest" column (col 2); IBNR/Ultimate are N/A.
+        rng = f"{get_column_letter(2)}{OUT_FIRST}:{get_column_letter(2)}{OUT_FIRST + n_origin - 1}"
+        style_formula(ws.cell(TOT_ROW, 2), f"=SUM({rng})", "#,##0", bg=C["output_bg"])
+        for c in [3, 4]:
+            cell = ws.cell(TOT_ROW, c)
+            cell.value = "N/A"
+            cell.fill = fill(C["diag_bg"])
+            cell.border = border()
+            cell.alignment = Alignment(horizontal="center")
+
+    # =========================================================
+    # SECTION 8b: COMPLETED SQUARE (project every future cell)
+    # Friedland Ch. 11 disposal-rate technique: "complete the square" by
+    # multiplying ultimate by the % reported at each maturity. We use:
+    #   projected_cell(i, j) = blended_ult(i) × (1 / CDF_j_to_ult)
+    # For observed cells we keep the actual value (not projected).
+    # The completed square reconciles exactly to the blended ultimate at
+    # the last column (since CDF_last = tail = 1.0 by construction, so
+    # 1/CDF_last = 1.0 → cell = blended_ult).
+    # =========================================================
+    if is_blendable:
+        SQ_HEAD = TOT_ROW + 2
+        ws.merge_cells(start_row=SQ_HEAD, start_column=1, end_row=SQ_HEAD, end_column=2 + n_dev)
+        style_header(ws.cell(SQ_HEAD, 1),
+                     "COMPLETED SQUARE — observed cells + projected future cells",
+                     bg=C["section_bg"], fg="1F3864")
+
+        # Header row: Origin | dev1 | dev2 | ... | Ultimate
+        SQ_COL_HEAD = SQ_HEAD + 1
+        style_label(ws.cell(SQ_COL_HEAD, 1), "Origin \\ Dev", bg=C["output_bg"])
+        for j, dp in enumerate(dev_periods):
+            style_header(ws.cell(SQ_COL_HEAD, 2 + j), str(dp),
+                         bg=C["output_bg"], fg="1F3864")
+        style_header(ws.cell(SQ_COL_HEAD, 2 + n_dev), "Ultimate",
+                     bg=C["output_bg"], fg="1F3864")
+
+        SQ_FIRST = SQ_COL_HEAD + 1
+        for i, origin in enumerate(origin_periods):
+            r = SQ_FIRST + i
+            style_label(ws.cell(r, 1), str(origin), bg=C["output_bg"])
+            data_row = DATA_FIRST_ROW + i
+            ult_cell = ws.cell(OUT_FIRST + i, 3).coordinate  # blended ult cell
+            for j, dp in enumerate(dev_periods):
+                obs_cell = ws.cell(data_row, 2 + j).coordinate
+                cdf_cell = ws.cell(CDF_ROW, 2 + j).coordinate
+                # If observed (numeric), show the actual value.
+                # Otherwise project: blended_ult × (1 / CDF_j)
+                # CDF_j is "from age j to ultimate", so 1/CDF_j = % reported at age j.
+                f_ = (f"=IF(ISNUMBER({obs_cell}),{obs_cell},"
+                      f"IFERROR({ult_cell}/{cdf_cell},NA()))")
+                style_formula(ws.cell(r, 2 + j), f_, "#,##0", bg=C["output_bg"])
+            # Last column: ultimate (= blended ult)
+            style_formula(ws.cell(r, 2 + n_dev),
+                          f"=IFERROR({ult_cell},NA())",
+                          "#,##0", bg=C["output_bg"])
+
+        # Column totals row (sum across origins for each dev column)
+        SQ_TOT = SQ_FIRST + n_origin
+        style_label(ws.cell(SQ_TOT, 1), "TOTAL", bg=C["output_bg"])
+        for j in range(n_dev + 1):
+            cs = ws.cell(SQ_FIRST, 2 + j).coordinate
+            ce = ws.cell(SQ_FIRST + n_origin - 1, 2 + j).coordinate
+            style_formula(ws.cell(SQ_TOT, 2 + j),
+                          f"=SUM({cs}:{ce})", "#,##0", bg=C["output_bg"])
+
+    # =========================================================
+    # SECTION 9: DIAGNOSTICS
+    # =========================================================
+    DIAG_HEAD = (TOT_ROW + 2) if not is_blendable else (SQ_FIRST + n_origin + 2)
+    ws.merge_cells(start_row=DIAG_HEAD, start_column=1, end_row=DIAG_HEAD, end_column=4)
+    style_header(ws.cell(DIAG_HEAD, 1), "DIAGNOSTICS",
+                 bg=C["section_bg"], fg="1F3864")
+
+    # Build proper diagnostic formulas
+    # Monotonicity: count cells where C(i,j) > C(i,j+1) on observed pairs.
+    # Range A spans dev columns 1..n-1 (cells whose right neighbor exists);
+    # Range B spans dev columns 2..n (the right neighbors).
+    # Non-monotonic cells are NOT necessarily an error — Friedland Ch. 7
+    # footnote 41 explicitly notes that some lines (subrogation/salvage,
+    # CNP exclusion, etc.) develop downward. We surface the count and quote
+    # the book so the user can interpret it correctly.
+    range_left  = f"{get_column_letter(2)}{DATA_FIRST_ROW}:{get_column_letter(2 + n_dev - 2)}{DATA_LAST_ROW}"
+    range_right = f"{get_column_letter(3)}{DATA_FIRST_ROW}:{get_column_letter(2 + n_dev - 1)}{DATA_LAST_ROW}"
+    friedland_quote = (
+        "There are some cases in which the development at the end of the "
+        "triangle is often less than one, such as for a line of business with "
+        "significant subrogation activity after claims are paid. For these "
+        "lines of business, the desire is still to have sufficient periods in "
+        "the development triangle so that non-zero development ceases, but in "
+        "this case the development factors may approach 1.000 from below. "
+        "(Friedland Ch. 7 fn. 41)"
+    )
+    monot_formula = (
+        f'=IF(SUMPRODUCT('
+        f'(ISNUMBER({range_left}))*'
+        f'(ISNUMBER({range_right}))*'
+        f'(({range_left})>({range_right}))'
+        f')=0,"OK","INFO: non-monotonic cells found — may be normal. {friedland_quote}")'
+    )
+
+    # Standard deviation of LDFs across dev periods (proxy for stability)
+    ldf_range = f"{get_column_letter(2)}{LDF_ROW}:{get_column_letter(2 + n_dev - 2)}{LDF_ROW}"
+    stdev_formula = f"=IFERROR(STDEV({ldf_range})/AVERAGE({ldf_range}),NA())"
+
+    diags = [
+        ("Cumulative monotonicity check", monot_formula, "@"),
+        ("Maturity (avg % reported)",
+         f"=AVERAGE({get_column_letter(5)}{OUT_FIRST}:{get_column_letter(5)}{OUT_FIRST + n_origin - 1})",
+         "0.0%"),
+        ("Avg LDF",
+         f"=AVERAGE({ldf_range})",
+         "0.0000"),
+        ("CV across LDFs (stability)",
+         stdev_formula,
+         "0.00%"),
+    ]
+    for i, (label, f_, fmt) in enumerate(diags):
+        r = DIAG_HEAD + 1 + i
+        style_label(ws.cell(r, 1), label, bg=C["diag_bg"])
+        style_formula(ws.cell(r, 2), f_, fmt, bg=C["diag_bg"])
+
+    # =========================================================
+    # Register on _index
+    # =========================================================
+    idx_ws = wb["_index"]
+    next_row = idx_ws.max_row + 1
+    row_vals = [triangle_id, sheet_name, type_,
+                "Y" if cumulative else "N", granularity, origin_basis,
+                lob, currency, ", ".join(links_to)]
+    for j, v in enumerate(row_vals, 1):
+        c = idx_ws.cell(next_row, j)
+        c.value = v
+        c.border = border()
+        c.alignment = Alignment(horizontal="left")
+
+    ws.freeze_panes = "B11"
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Python-computed methods
+# Real implementations of:
+#   - Mack (1993/1999) variance + standard error
+#   - Renshaw-Verrall over-dispersed Poisson GLM (chain-ladder consistent)
+#   - Frequency-Severity with separate count & severity development
+#   - Bayesian Gamma-Poisson conjugate update
+# ---------------------------------------------------------------------------
+def volume_weighted_ldfs(matrix, n_dev):
+    """Standard volume-weighted age-to-age factors."""
+    n_origin = len(matrix)
+    ldfs = []
+    for j in range(n_dev - 1):
+        num, den = 0.0, 0.0
+        for i in range(n_origin):
+            a, b = matrix[i][j], matrix[i][j+1]
+            if a is not None and b is not None and a > 0:
+                num += b
+                den += a
+        ldfs.append(num / den if den > 0 else 1.0)
+    return ldfs
+
+def cdfs_from_ldfs(ldfs, n_dev, tail=1.0):
+    cdfs = []
+    for j in range(n_dev):
+        prod = tail
+        for k in range(j, n_dev - 1):
+            prod *= ldfs[k]
+        cdfs.append(prod)
+    return cdfs
+
+def chain_ladder_ultimates(matrix, dev_periods, tail=1.0):
+    n_dev = len(dev_periods)
+    ldfs = volume_weighted_ldfs(matrix, n_dev)
+    cdfs = cdfs_from_ldfs(ldfs, n_dev, tail)
+    ults = []
+    for i in range(len(matrix)):
+        latest_j = max(j for j in range(n_dev) if matrix[i][j] is not None)
+        ults.append(matrix[i][latest_j] * cdfs[latest_j])
+    return ults, ldfs, cdfs
+
+# ---------------------------------------------------------------------------
+# Mack (1993/1999) — distribution-free variance & MSE
+# Canonical recursive form per Mack 1999, separating process and parameter risk.
+# Cross-validated against chainladder-python's MackChainladder (casact/chainladder-python).
+# ---------------------------------------------------------------------------
+def mack_method(matrix, dev_periods, tail=1.0, alpha=1):
+    """
+    Mack 1999 recursive method, with separate process and parameter risk
+    propagation (matches the canonical chainladder-python implementation):
+
+    Process risk:
+      proc_{i,k+1}^2 = C_hat_{i,k} * sigma_k^2  +  (f_k * proc_{i,k})^2
+
+    Parameter risk:
+      param_{i,k+1}^2 = C_hat_{i,k}^2 * sigma_k^2 / S_k  +  (f_k * param_{i,k})^2
+
+    Per-origin Mack SE:    sqrt(proc^2 + param^2) at ultimate
+    Total process risk:    sqrt(sum_i proc_i^2)   (independent across origins)
+    Total parameter risk:  recursive across origins (correlated through shared f_k):
+                           t_param_{k+1}^2 = (sum_i C_hat_{i,k} * std_err_k)^2
+                                           + (f_k * t_param_k)^2
+    Total Mack SE:         sqrt(total_proc^2 + total_param^2)
+
+    Note: alpha=1 is the standard (volume-weighted) chain ladder.
+    Returns dict with ultimates, reserves, se, cv, sigma2, total_se, total_cv.
+    """
+    n_origin = len(matrix)
+    n_dev    = len(dev_periods)
+    ldfs     = volume_weighted_ldfs(matrix, n_dev)
+
+    # --- sigma_k^2 estimator (Mack 1993)
+    sigma2 = []
+    for k in range(n_dev - 1):
+        contrib = []
+        n_pairs = 0
+        for i in range(n_origin):
+            a, b = matrix[i][k], matrix[i][k+1]
+            if a is not None and b is not None and a > 0:
+                F_ik = b / a
+                contrib.append(a * (F_ik - ldfs[k]) ** 2)
+                n_pairs += 1
+        if n_pairs > 1:
+            s2 = sum(contrib) / (n_pairs - 1)
+        elif n_pairs == 1:
+            # Mack's recommended fallback for the last dev period:
+            # sigma_{n-1}^2 = min(sigma_{n-2}^4 / sigma_{n-3}^2,
+            #                     min(sigma_{n-3}^2, sigma_{n-2}^2))
+            if len(sigma2) >= 2 and sigma2[-2] > 0:
+                s2 = min(sigma2[-1] ** 2 / sigma2[-2],
+                         min(sigma2[-1], sigma2[-2]))
+            elif len(sigma2) >= 1:
+                s2 = sigma2[-1]
+            else:
+                s2 = 0.0
+        else:
+            s2 = 0.0
+        sigma2.append(s2)
+
+    # --- column sums S_k that went into the f_k estimate (i.e. pairs only).
+    # For Mack's parameter risk, S_k must be the SAME denominator used for the
+    # volume-weighted f_k: only origins where both C_{i,k} and C_{i,k+1} are
+    # observed contribute. (Without this, parameter risk is understated.)
+    column_sums = []
+    for k in range(n_dev - 1):
+        s = 0.0
+        for i in range(n_origin):
+            if (matrix[i][k] is not None and matrix[i][k+1] is not None):
+                s += matrix[i][k]
+        column_sums.append(s)
+    # last column: no f_k after it, but keep for completeness (use observed sum)
+    last = sum(matrix[i][n_dev-1] for i in range(n_origin)
+               if matrix[i][n_dev-1] is not None)
+    column_sums.append(last)
+
+    # --- latest dev index per origin
+    latest_j_list = [max(j for j in range(n_dev) if matrix[i][j] is not None)
+                     for i in range(n_origin)]
+
+    # --- project full triangle (C_hat values for k > latest)
+    C_hat = [[None]*n_dev for _ in range(n_origin)]
+    for i in range(n_origin):
+        latest_j = latest_j_list[i]
+        for j in range(0, latest_j + 1):
+            C_hat[i][j] = matrix[i][j] if matrix[i][j] is not None else None
+        for k in range(latest_j, n_dev - 1):
+            C_hat[i][k+1] = C_hat[i][k] * ldfs[k]
+
+    # --- f_k vector with optional tail
+    # f_k[k] gives factor from dev k -> k+1; f[n_dev-1] is tail (k -> ultimate)
+    f_k = list(ldfs) + [tail]
+    sigma2_ext = list(sigma2) + [0.0]  # tail variance assumed 0 unless given
+
+    # --- Process risk and parameter risk recursion (Mack 1999)
+    proc_risk = [0.0] * n_origin
+    param_risk = [0.0] * n_origin
+    for i in range(n_origin):
+        latest_j = latest_j_list[i]
+        p2 = 0.0  # process risk squared, starting at 0 at latest known
+        q2 = 0.0  # parameter risk squared, starting at 0
+        for k in range(latest_j, n_dev - 1):
+            C = C_hat[i][k]
+            s2 = sigma2[k]
+            S = column_sums[k]
+            f = f_k[k]
+            # Mack 1999 recursion (separate process and parameter):
+            p2 = C * s2 + (f ** 2) * p2
+            q2 = ((C ** 2) * s2 / S if S > 0 else 0.0) + (f ** 2) * q2
+        proc_risk[i] = math.sqrt(p2)
+        param_risk[i] = math.sqrt(q2)
+
+    # --- ultimates and per-origin SE
+    ultimates = [C_hat[i][n_dev - 1] * tail for i in range(n_origin)]
+    reserves  = [ultimates[i] - matrix[i][latest_j_list[i]] for i in range(n_origin)]
+    se = [math.sqrt(proc_risk[i] ** 2 + param_risk[i] ** 2) for i in range(n_origin)]
+    cv = [se[i] / ultimates[i] if ultimates[i] > 0 else 0.0
+          for i in range(n_origin)]
+
+    # --- Total process risk: independent across origins -> quadrature sum
+    total_proc = math.sqrt(sum(p ** 2 for p in proc_risk))
+
+    # --- Total parameter risk: recursive across dev periods, sum-of-C across origins
+    # Following chainladder-python:
+    # t_param^2 propagates as: (sum_i C_hat_{i,k} where i still developing) * std_err_k)^2
+    #                         + f_k^2 * prev_t_param^2
+    # where std_err_k = sigma_k / sqrt(S_k)
+    t_param_sq = 0.0
+    for k in range(n_dev - 1):
+        # sum of C_hat for origins still developing at age k+1 (i.e. latest_j[i] <= k)
+        sum_C = 0.0
+        for i in range(n_origin):
+            if latest_j_list[i] <= k:
+                sum_C += C_hat[i][k]
+        if column_sums[k] > 0:
+            std_err_k = math.sqrt(sigma2[k] / column_sums[k])
+        else:
+            std_err_k = 0.0
+        t_param_sq = (sum_C * std_err_k) ** 2 + (f_k[k] ** 2) * t_param_sq
+    total_param = math.sqrt(t_param_sq)
+
+    total_se  = math.sqrt(total_proc ** 2 + total_param ** 2)
+    total_ult = sum(ultimates)
+    total_res = sum(reserves)
+
+    return {
+        "ultimates": ultimates,
+        "reserves": reserves,
+        "se": se,
+        "cv": cv,
+        "process_risk": proc_risk,
+        "parameter_risk": param_risk,
+        "sigma2": sigma2,
+        "ldfs": ldfs,
+        "total_ultimate": total_ult,
+        "total_reserve": total_res,
+        "total_se": total_se,
+        "total_process_risk": total_proc,
+        "total_parameter_risk": total_param,
+        "total_cv": total_se / total_ult if total_ult > 0 else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GLM — Over-dispersed Poisson chain-ladder GLM (Renshaw-Verrall 1998)
+# ---------------------------------------------------------------------------
+def glm_odp_method(matrix, dev_periods, tail=1.0, max_iter=100, tol=1e-9):
+    """
+    Models incremental losses as:
+        E[Y_ij] = mu_ij = alpha_i * beta_j   (multiplicative)
+        Var[Y_ij] = phi * mu_ij              (over-dispersed Poisson)
+    Fit by IRLS / direct MLE. Under canonical log link with Poisson,
+    point estimates are identical to volume-weighted chain ladder
+    (Renshaw-Verrall 1998) — but the GLM gives proper parameter risk.
+
+    Returns ultimates per origin + total + dispersion phi.
+    """
+    n_origin = len(matrix)
+    n_dev    = len(dev_periods)
+
+    # --- convert cumulative -> incremental
+    incr = [[None]*n_dev for _ in range(n_origin)]
+    for i in range(n_origin):
+        for j in range(n_dev):
+            v = matrix[i][j]
+            if v is None:
+                continue
+            if j == 0:
+                incr[i][j] = v
+            else:
+                prev = matrix[i][j-1]
+                if prev is None:
+                    incr[i][j] = v
+                else:
+                    incr[i][j] = v - prev
+
+    # --- MLE for multiplicative model on observed cells
+    # Observed = upper-triangle: cells where incr[i][j] is not None.
+    # Note on negative incrementals: classic Poisson ODP requires y >= 0,
+    # but the IPF/marginal-totals algorithm equivalent to volume-weighted
+    # CL also works as a quasi-likelihood/method-of-moments fit and is
+    # well-defined for negative cells as long as column sums remain positive.
+    # We include negative-valued cells but flag them for the user.
+    alpha = [1.0] * n_origin
+    beta  = [1.0] * n_dev
+
+    observed = [[(incr[i][j] is not None) for j in range(n_dev)]
+                for i in range(n_origin)]
+    has_negatives = any(
+        observed[i][j] and incr[i][j] < 0
+        for i in range(n_origin) for j in range(n_dev)
+    )
+
+    # initialize beta by column sums of observed (clamp away from zero to avoid div by zero)
+    for j in range(n_dev):
+        s = sum(incr[i][j] for i in range(n_origin) if observed[i][j])
+        # if a column sums to <=0 we can't run GLM properly; fall back to small positive
+        beta[j] = s if s > 1e-9 else 1e-9
+    # normalize
+    tot = sum(beta)
+    beta = [b/tot for b in beta]
+
+    for it in range(max_iter):
+        # update alpha: alpha_i = (sum_j observed Y_ij) / (sum_j observed beta_j)
+        new_alpha = []
+        for i in range(n_origin):
+            num = sum(incr[i][j] for j in range(n_dev) if observed[i][j])
+            den = sum(beta[j]    for j in range(n_dev) if observed[i][j])
+            new_alpha.append(num / den if den > 0 else 0.0)
+        # update beta
+        new_beta = []
+        for j in range(n_dev):
+            num = sum(incr[i][j] for i in range(n_origin) if observed[i][j])
+            den = sum(new_alpha[i] for i in range(n_origin) if observed[i][j])
+            new_beta.append(num / den if den > 0 else 0.0)
+        # convergence check
+        diff = sum(abs(a-b) for a,b in zip(alpha, new_alpha)) + \
+               sum(abs(a-b) for a,b in zip(beta, new_beta))
+        alpha, beta = new_alpha, new_beta
+        if diff < tol:
+            break
+
+    # --- compute fitted, residuals, dispersion phi
+    fitted = [[alpha[i]*beta[j] for j in range(n_dev)] for i in range(n_origin)]
+    n_obs = 0
+    p_params = n_origin + n_dev - 1  # alpha and beta less one for identifiability
+    pearson_sum = 0.0
+    for i in range(n_origin):
+        for j in range(n_dev):
+            if observed[i][j] and fitted[i][j] > 0:
+                pearson_sum += (incr[i][j] - fitted[i][j])**2 / fitted[i][j]
+                n_obs += 1
+    phi = pearson_sum / max(n_obs - p_params, 1)
+
+    # --- ultimates: fill lower triangle with fitted, sum + tail
+    ultimates = []
+    for i in range(n_origin):
+        total_incr = 0.0
+        for j in range(n_dev):
+            total_incr += fitted[i][j]
+        # apply tail to ultimate (proportional)
+        ultimates.append(total_incr * tail)
+
+    return {
+        "ultimates": ultimates,
+        "alpha": alpha,
+        "beta": beta,
+        "phi": phi,
+        "has_negatives": has_negatives,
+        "total_ultimate": sum(ultimates),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Frequency-Severity — separate development of counts and severities
+# ---------------------------------------------------------------------------
+def frequency_severity_method(paid_matrix, counts_matrix, dev_periods, tail=1.0):
+    """
+    Develops counts to ultimate via CL on counts triangle.
+    Develops AVERAGE severity by accident year: sev_ij = paid_ij / counts_ij.
+    Applies CL to the severity triangle for ultimate severity.
+    Ultimate paid = ultimate counts * ultimate severity.
+    """
+    n_origin = len(paid_matrix)
+    n_dev    = len(dev_periods)
+
+    # --- ultimate counts via CL on counts
+    count_ults, _, _ = chain_ladder_ultimates(counts_matrix, dev_periods, tail=1.0)
+
+    # --- build severity triangle (incremental? use cumulative paid / cumulative count
+    # because both are cumulative, average severity-to-date)
+    sev = [[None]*n_dev for _ in range(n_origin)]
+    for i in range(n_origin):
+        for j in range(n_dev):
+            p = paid_matrix[i][j]
+            c = counts_matrix[i][j]
+            if p is not None and c is not None and c > 0:
+                sev[i][j] = p / c
+
+    # --- CL on severity triangle to get ultimate severity per origin
+    # severity is not cumulative in the additive sense, but average severity tends
+    # to develop upward as more claims close at higher amounts. We treat the
+    # severity grid the same way (multiplicative development) and use CL.
+    sev_ldfs = volume_weighted_ldfs(sev, n_dev)
+    sev_cdfs = cdfs_from_ldfs(sev_ldfs, n_dev, tail)
+    ult_sev = []
+    for i in range(n_origin):
+        valid_js = [j for j in range(n_dev) if sev[i][j] is not None]
+        if not valid_js:
+            ult_sev.append(None)
+            continue
+        latest_j = max(valid_js)
+        ult_sev.append(sev[i][latest_j] * sev_cdfs[latest_j])
+
+    ultimates = []
+    for i in range(n_origin):
+        if ult_sev[i] is None or count_ults[i] is None:
+            ultimates.append(None)
+        else:
+            ultimates.append(count_ults[i] * ult_sev[i])
+
+    return {
+        "ultimates": ultimates,
+        "ultimate_counts": count_ults,
+        "ultimate_severity": ult_sev,
+        "severity_ldfs": sev_ldfs,
+        "total_ultimate": sum(u for u in ultimates if u is not None),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bayesian — Gamma-Poisson conjugate update per origin
+# ---------------------------------------------------------------------------
+def bayesian_method(matrix, dev_periods, prior_mean_per_origin,
+                    prior_strength=10, tail=1.0):
+    """
+    Conjugate Bayesian model:
+      Prior: ultimate_i ~ Gamma(a, b) with E = a/b = prior_mean_per_origin,
+             prior_strength controls peakedness (higher = stronger prior).
+      Likelihood: observed cumulative C_{i,latest} ~ Poisson(percent_reported * ultimate)
+        where percent_reported = 1/CDF
+      Posterior:
+        a_post = a + C_{i,latest}
+        b_post = b + percent_reported_i
+        posterior mean ultimate = a_post / b_post
+
+    This produces a credibility weight Z that emerges from the data, not a
+    fixed constant.
+    """
+    n_origin = len(matrix)
+    n_dev    = len(dev_periods)
+    _, ldfs, cdfs = chain_ladder_ultimates(matrix, dev_periods, tail=tail)
+
+    # prior parameters: E = a/b, Var = a/b^2; choose b = prior_strength / prior_mean
+    # so that E = prior_mean and Var = prior_mean / prior_strength
+    ultimates = []
+    z_weights = []
+    for i in range(n_origin):
+        latest_j = max(j for j in range(n_dev) if matrix[i][j] is not None)
+        latest = matrix[i][latest_j]
+        pct_reported = 1.0 / cdfs[latest_j] if cdfs[latest_j] > 0 else 0.0
+
+        prior_mean = prior_mean_per_origin
+        if prior_mean <= 0:
+            ultimates.append(latest * cdfs[latest_j])
+            z_weights.append(1.0)
+            continue
+        b = prior_strength / prior_mean
+        a = prior_strength
+
+        a_post = a + latest
+        b_post = b + pct_reported
+        post_mean = a_post / b_post if b_post > 0 else prior_mean
+
+        # implied credibility on observed CL ultimate:
+        cl_ult = latest * cdfs[latest_j]
+        if cl_ult > 0 and prior_mean != cl_ult:
+            Z = (post_mean - prior_mean) / (cl_ult - prior_mean)
+            Z = max(0.0, min(1.0, Z))
+        else:
+            Z = 1.0
+        ultimates.append(post_mean)
+        z_weights.append(Z)
+
+    return {
+        "ultimates": ultimates,
+        "credibility": z_weights,
+        "total_ultimate": sum(ultimates),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: write all python results into the sheet
+# ---------------------------------------------------------------------------
+def _is_all_none(m):
+    """Return True if matrix is None, empty, or every cell is None."""
+    if m is None:
+        return True
+    try:
+        for row in m:
+            for v in row:
+                if v is not None:
+                    return False
+        return True
+    except (TypeError, IndexError):
+        return True
+
+
+def run_python_methods(triangle_id, sheet_name, matrix, dev_periods, origin_periods,
+                       counts_matrix=None, exposure_matrix=None,
+                       prior_total=None, premium=None, tail=1.0):
+    ws = wb[sheet_name]
+    n_origin = len(matrix)
+
+    # If the data triangle has no observations, all methods are N/A. Mark and exit.
+    if _is_all_none(matrix):
+        meth_first = None
+        for r in range(1, ws.max_row + 1):
+            if ws.cell(r, 1).value == "Origin" and ws.cell(r, 2).value == "CL":
+                meth_first = r + 1
+                break
+        if meth_first is not None:
+            for i in range(n_origin):
+                r = meth_first + i
+                for k in [1, 5, 6, 7]:  # Mack, FS, GLM, Bayes
+                    cell = ws.cell(r, 2 + k)
+                    cell.value = "=NA()"
+                    cell.fill = fill(C["py_bg"])
+                    cell.border = border()
+                    cell.alignment = Alignment(horizontal="center")
+        return
+
+    # Compute each method
+    mack_res = mack_method(matrix, dev_periods, tail=tail)
+    glm_res  = glm_odp_method(matrix, dev_periods, tail=tail)
+
+    # Frequency-Severity needs a real counts triangle (not None, not all-None).
+    fs_res = None
+    if not _is_all_none(counts_matrix):
+        try:
+            fs_res = frequency_severity_method(matrix, counts_matrix, dev_periods, tail=tail)
+        except Exception:
+            fs_res = None  # any failure → mark FS as N/A, don't crash the build
+
+    # Bayesian needs a numeric prior > 0.
+    bayes_res = None
+    if prior_total is not None and prior_total > 0:
+        try:
+            prior_per_origin = prior_total / n_origin
+            bayes_res = bayesian_method(matrix, dev_periods, prior_per_origin,
+                                        prior_strength=10, tail=tail)
+        except Exception:
+            bayes_res = None
+
+    # Find METH_FIRST row
+    meth_first = None
+    for r in range(1, ws.max_row + 1):
+        if ws.cell(r, 1).value == "Origin" and ws.cell(r, 2).value == "CL":
+            meth_first = r + 1
+            break
+    if meth_first is None:
+        return
+
+    # Column indices in METHODS list:
+    # 0=CL, 1=Mack, 2=BF, 3=CC, 4=LR, 5=FS, 6=GLM, 7=Bayes
+    for i in range(n_origin):
+        r = meth_first + i
+
+        # Mack (col 1)
+        style_static(ws.cell(r, 2 + 1),
+                     round(mack_res["ultimates"][i]),
+                     num_fmt="#,##0", bg=C["py_bg"])
+
+        # FS (col 5)
+        if fs_res is not None and fs_res["ultimates"][i] is not None:
+            style_static(ws.cell(r, 2 + 5),
+                         round(fs_res["ultimates"][i]),
+                         num_fmt="#,##0", bg=C["py_bg"])
+        else:
+            cell = ws.cell(r, 2 + 5)
+            cell.value = "=NA()"
+            cell.fill = fill(C["py_bg"])
+            cell.border = border()
+            cell.alignment = Alignment(horizontal="center")
+
+        # GLM (col 6)
+        style_static(ws.cell(r, 2 + 6),
+                     round(glm_res["ultimates"][i]),
+                     num_fmt="#,##0", bg=C["py_bg"])
+
+        # Bayesian (col 7)
+        if bayes_res is not None:
+            style_static(ws.cell(r, 2 + 7),
+                         round(bayes_res["ultimates"][i]),
+                         num_fmt="#,##0", bg=C["py_bg"])
+        else:
+            cell = ws.cell(r, 2 + 7)
+            cell.value = "=NA()"
+            cell.fill = fill(C["py_bg"])
+            cell.border = border()
+            cell.alignment = Alignment(horizontal="center")
+
+    # ----- Append a Python diagnostics block under existing diagnostics
+    # find next free row
+    last_row = ws.max_row
+    diag_start = last_row + 2
+
+    ws.merge_cells(start_row=diag_start, start_column=1, end_row=diag_start, end_column=4)
+    style_header(ws.cell(diag_start, 1),
+                 "PYTHON METHOD DIAGNOSTICS (Mack SE / GLM phi / Bayes Z)",
+                 bg=C["section_bg"], fg="1F3864")
+
+    # Mack standard errors
+    style_label(ws.cell(diag_start + 1, 1), "Mack — Origin", bg=C["py_bg"])
+    style_label(ws.cell(diag_start + 1, 2), "Ultimate", bg=C["py_bg"])
+    style_label(ws.cell(diag_start + 1, 3), "Std Error", bg=C["py_bg"])
+    style_label(ws.cell(diag_start + 1, 4), "CV", bg=C["py_bg"])
+    for i, origin in enumerate(origin_periods):
+        r = diag_start + 2 + i
+        ws.cell(r, 1).value = origin
+        ws.cell(r, 1).border = border()
+        ws.cell(r, 1).alignment = Alignment(horizontal="center")
+        style_static(ws.cell(r, 2), round(mack_res["ultimates"][i]), "#,##0", bg=C["py_bg"])
+        style_static(ws.cell(r, 3), round(mack_res["se"][i]), "#,##0", bg=C["py_bg"])
+        style_static(ws.cell(r, 4), round(mack_res["cv"][i], 4), "0.00%", bg=C["py_bg"])
+    # Total
+    tot_row = diag_start + 2 + n_origin
+    style_label(ws.cell(tot_row, 1), "TOTAL", bg=C["py_bg"])
+    style_static(ws.cell(tot_row, 2), round(mack_res["total_ultimate"]), "#,##0", bg=C["py_bg"])
+    style_static(ws.cell(tot_row, 3), round(mack_res["total_se"]), "#,##0", bg=C["py_bg"])
+    style_static(ws.cell(tot_row, 4), round(mack_res["total_cv"], 4), "0.00%", bg=C["py_bg"])
+
+    # GLM dispersion
+    glm_row = tot_row + 2
+    style_label(ws.cell(glm_row, 1), "GLM — Dispersion (phi)", bg=C["py_bg"])
+    style_static(ws.cell(glm_row, 2), round(glm_res["phi"], 4), "0.0000", bg=C["py_bg"])
+    style_label(ws.cell(glm_row + 1, 1), "GLM — Total Ultimate", bg=C["py_bg"])
+    style_static(ws.cell(glm_row + 1, 2), round(glm_res["total_ultimate"]), "#,##0", bg=C["py_bg"])
+    if glm_res.get("has_negatives"):
+        style_label(ws.cell(glm_row + 2, 1),
+                    "GLM — WARNING: negative incrementals detected (ODP assumes y≥0)",
+                    bg=C["warn_bg"])
+
+    # Bayesian credibilities
+    if bayes_res is not None:
+        b_head = glm_row + 3
+        style_label(ws.cell(b_head, 1), "Bayes — Origin", bg=C["py_bg"])
+        style_label(ws.cell(b_head, 2), "Posterior Ult", bg=C["py_bg"])
+        style_label(ws.cell(b_head, 3), "Credibility Z", bg=C["py_bg"])
+        for i, origin in enumerate(origin_periods):
+            r = b_head + 1 + i
+            ws.cell(r, 1).value = origin
+            ws.cell(r, 1).border = border()
+            ws.cell(r, 1).alignment = Alignment(horizontal="center")
+            style_static(ws.cell(r, 2), round(bayes_res["ultimates"][i]), "#,##0", bg=C["py_bg"])
+            style_static(ws.cell(r, 3), round(bayes_res["credibility"][i], 4), "0.00%", bg=C["py_bg"])
+
+
+# ===========================================================================
+# BUILD: index + control + 4 sample triangles
+# ===========================================================================
+def main():
+    build_index_sheet()
+    build_control_sheet()
+
+    origin_periods = [2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
+    dev_periods    = [12, 24, 36, 48, 60, 72, 84, 96, 108, 120]
+
+    paid_matrix = [
+        [359685, 937044, 1289167, 1461043, 1595883, 1712679, 1760263, 1836124, 1881031, 1906497],
+        [326645, 863573, 1224911, 1458598, 1613920, 1734764, 1829018, 1889214, 1945553, None],
+        [413045, 1064742, 1474672, 1710179, 1857797, 1987730, 2111016, 2198170, None, None],
+        [693700, 1820160, 2321475, 2691135, 2868095, 3083695, 3233984, None, None, None],
+        [705022, 1726515, 2246522, 2538733, 2821584, 3050571, None, None, None, None],
+        [590771, 1445341, 1857186, 2228200, 2476467, None, None, None, None, None],
+        [606467, 1442232, 1822455, 2092672, None, None, None, None, None, None],
+        [476988, 1189596, 1585808, None, None, None, None, None, None, None],
+        [447519, 1112296, None, None, None, None, None, None, None, None],
+        [482168, None, None, None, None, None, None, None, None, None],
+    ]
+
+    # AXIS labels this table "Case Incurred Losses"
+    incd_matrix = [
+        [816766, 1361158, 1614422, 1736606, 1863945, 1932560, 1953463, 1985024, 2013024, 2026721],
+        [810851, 1328550, 1601679, 1770452, 1883774, 1971225, 2019800, 2071224, 2087970, None],
+        [945590, 1580243, 1879055, 2055023, 2188748, 2264366, 2346478, 2412297, None, None],
+        [1609549, 2622795, 3026468, 3258333, 3404059, 3508244, 3594108, None, None, None],
+        [1417487, 2451602, 2834088, 3108440, 3296794, 3420051, None, None, None, None],
+        [1031547, 2076844, 2410741, 2727395, 2907514, None, None, None, None, None],
+        [1164044, 2000962, 2324749, 2542271, None, None, None, None, None, None],
+        [1014535, 1794109, 2080119, None, None, None, None, None, None, None],
+        [910958, 1667644, None, None, None, None, None, None, None, None],
+        [845025, None, None, None, None, None, None, None, None, None],
+    ]
+
+    # AXIS 2023 Global Loss Triangles does not disclose reported claim counts.
+    # Keeping this as a same-sized placeholder only.
+    counts_matrix = [
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None, None, None],
+    ]
+
+    # AXIS shows earned premium by origin year, not as a development triangle.
+    premium_matrix = [
+        [3604010, None, None, None, None, None, None, None, None, None],
+        [3492498, None, None, None, None, None, None, None, None, None],
+        [3618790, None, None, None, None, None, None, None, None, None],
+        [4126591, None, None, None, None, None, None, None, None, None],
+        [4720637, None, None, None, None, None, None, None, None, None],
+        [4520391, None, None, None, None, None, None, None, None, None],
+        [4334311, None, None, None, None, None, None, None, None, None],
+        [4614435, None, None, None, None, None, None, None, None, None],
+        [5087226, None, None, None, None, None, None, None, None, None],
+        [5114054, None, None, None, None, None, None, None, None, None],
+    ]
+
+    premium_per_origin = [
+        3604010, 3492498, 3618790, 4126591, 4720637,
+        4520391, 4334311, 4614435, 5087226, 5114054
+    ]
+
+    # 1. Premium triangle
+    add_triangle(
+        triangle_id="T4", sheet_name="T4_premium",
+        type_="premium", cumulative=True, granularity="annual",
+        origin_basis="accident", lob="consolidated_total", currency="USD",
+        origin_periods=origin_periods, dev_periods=dev_periods,
+        data_matrix=premium_matrix,
+        links_to=[],
+    )
+
+    # 2. Counts
+    # AXIS does not disclose counts in this source, so this is a placeholder triangle.
+    add_triangle(
+        triangle_id="T3", sheet_name="T3_counts",
+        type_="reported_counts", cumulative=True, granularity="annual",
+        origin_basis="accident", lob="consolidated_total", currency="USD",
+        origin_periods=origin_periods, dev_periods=dev_periods,
+        data_matrix=counts_matrix,
+        links_to=["T1"],
+    )
+
+    # 3. Paid
+    add_triangle(
+        triangle_id="T1", sheet_name="T1_paid",
+        type_="paid_loss", cumulative=True, granularity="annual",
+        origin_basis="accident", lob="consolidated_total", currency="USD",
+        origin_periods=origin_periods, dev_periods=dev_periods,
+        data_matrix=paid_matrix,
+        links_to=["T2", "T3", "T4"],
+        elr=None,
+        premium_link="T4_premium",
+        prior_ultimate=None,
+    )
+
+    # 4. Incurred
+    add_triangle(
+        triangle_id="T2", sheet_name="T2_incurred",
+        type_="incurred_loss", cumulative=True, granularity="annual",
+        origin_basis="accident", lob="consolidated_total", currency="USD",
+        origin_periods=origin_periods, dev_periods=dev_periods,
+        data_matrix=incd_matrix,
+        links_to=["T1", "T3", "T4"],
+        elr=None,
+        premium_link="T4_premium",
+        prior_ultimate=None,
+    )
+
+    # Run Python methods on paid + incurred + counts.
+    # Counts develops like a loss triangle; premium does not.
+    run_python_methods(
+        "T1", "T1_paid", paid_matrix, dev_periods, origin_periods,
+        counts_matrix=None, exposure_matrix=premium_matrix,
+        prior_total=12500, premium=premium_per_origin,
+    )
+    run_python_methods(
+        "T2", "T2_incurred", incd_matrix, dev_periods, origin_periods,
+        counts_matrix=counts_matrix, exposure_matrix=premium_matrix,
+        prior_total=12800, premium=premium_per_origin,
+    )
+    # Counts triangle: only Mack and GLM make sense; not BF/CC/LR (no ELR
+    # concept for counts) and not Freq-Sev (it IS the count input).
+    run_python_methods(
+        "T3", "T3_counts", counts_matrix, dev_periods, origin_periods,
+        counts_matrix=None, exposure_matrix=None,
+        prior_total=None, premium=None,
+    )
+    # Premium triangle: Mack/FS/GLM/Bayes don't apply; mark them as N/A
+    # (otherwise they remain as "PENDING" placeholders, which is misleading).
+    def mark_python_methods_na(sheet_name, n_origin):
+        ws = wb[sheet_name]
+        meth_first = None
+        for r in range(1, ws.max_row + 1):
+            if ws.cell(r, 1).value == "Origin" and ws.cell(r, 2).value == "CL":
+                meth_first = r + 1
+                break
+        if meth_first is None:
+            return
+        # Cols: 0=CL, 1=Mack, 2=BF, 3=CC, 4=LR, 5=FS, 6=GLM, 7=Bayes
+        # Mark Mack(1), FS(5), GLM(6), Bayes(7) as #N/A formula
+        for i in range(n_origin):
+            r = meth_first + i
+            for k in [1, 5, 6, 7]:
+                cell = ws.cell(r, 2 + k)
+                cell.value = "=NA()"
+                cell.fill = fill(C["py_bg"])
+                cell.border = border()
+                cell.alignment = Alignment(horizontal="center")
+
+    mark_python_methods_na("T4_premium", len(origin_periods))
+
+    # Order tabs: _index, _control, then triangles
+    order = ["_index", "_control", "T1_paid", "T2_incurred", "T3_counts", "T4_premium"]
+    wb._sheets = [wb[name] for name in order]
+
+    wb.save(OUTPUT_PATH)
+    print(f"Saved: {OUTPUT_PATH}")
+    print(f"Sheets: {[s.title for s in wb.worksheets]}")
+
+
+if __name__ == "__main__":
+    import sys, traceback
+    try:
+        main()
+    except PermissionError as e:
+        print("\n" + "="*70)
+        print("ERROR — could not save the workbook.")
+        print("="*70)
+        print(f"\n  {e}")
+        print("\nThis usually means the .xlsx file is already open in Excel.")
+        print("Close it in Excel, then re-run the script.")
+        print("="*70)
+        input("\nPress Enter to close...")
+    except Exception:
+        print("\n" + "="*70)
+        print("ERROR — build failed:")
+        print("="*70)
+        traceback.print_exc(file=sys.stdout)
+        print("="*70)
+        input("\nPress Enter to close...")
