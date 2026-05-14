@@ -83,7 +83,7 @@ Change `OUTPUT_PATH` at the top of the script to redirect.
 
 1. Install `openpyxl`
 2. Set `OUTPUT_PATH` to your desired output location
-3. Replace `paid_matrix`, `incd_matrix`, `counts_matrix`, `premium_matrix` with your data (`None` = missing cell)
+3. Populate paid_matrix, incd_matrix, counts_matrix, and premium_matrix with your data — whether copied from another Excel sheet, a system export, or any other source. Use None for missing or future cells. 
 4. Run:
 
 ```bash
